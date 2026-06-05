@@ -433,4 +433,64 @@ void main() {
       m.dispose();
     });
   });
+
+  group('timed auto-stop (purge)', () {
+    test('requests idle when the steam duration elapses', () async {
+      // Duration 1s, lead 750ms → the stop fires ~250ms into the steam.
+      workflow.updateWorkflow(
+        steamSettings:
+            workflow.currentWorkflow.steamSettings.copyWith(duration: 1),
+      );
+      final m = _TestMachine();
+      de1.emit(m);
+      await settle();
+
+      m.emit(_snap(state: MachineState.steam));
+      await settle();
+      expect(m.requested, isEmpty);
+
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(m.requested, contains(MachineState.idle),
+          reason: 'timer must request idle so the DE1 runs its auto-purge');
+      m.dispose();
+    });
+
+    test('does not request idle after steam has already ended', () async {
+      workflow.updateWorkflow(
+        steamSettings:
+            workflow.currentWorkflow.steamSettings.copyWith(duration: 1),
+      );
+      final m = _TestMachine();
+      de1.emit(m);
+      await settle();
+
+      m.emit(_snap(state: MachineState.steam));
+      await settle();
+      m.emit(_snap(state: MachineState.idle)); // ended before the timer
+      await settle();
+      m.requested.clear();
+
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(m.requested, isEmpty,
+          reason: 'the duration timer must be cancelled once steam ends');
+      m.dispose();
+    });
+
+    test('no timed stop when duration is 0 (disabled)', () async {
+      workflow.updateWorkflow(
+        steamSettings:
+            workflow.currentWorkflow.steamSettings.copyWith(duration: 0),
+      );
+      final m = _TestMachine();
+      de1.emit(m);
+      await settle();
+
+      m.emit(_snap(state: MachineState.steam));
+      await settle();
+
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      expect(m.requested, isEmpty);
+      m.dispose();
+    });
+  });
 }

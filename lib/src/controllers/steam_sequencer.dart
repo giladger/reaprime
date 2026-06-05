@@ -64,6 +64,16 @@ class SteamSequencer {
   Workflow? _openWorkflow;
   final List<SteamSnapshot> _measurements = [];
   bool _appSideStopRequested = false;
+  Timer? _durationStopTimer;
+
+  /// Fire the timed steam stop this long *before* the DE1's own steam-duration
+  /// auto-stop. The DE1 only runs its auto-purge when steam is ended by a
+  /// *command* (`requestState(idle)` — the same path as a manual stop), not
+  /// when its internal duration silently lapses. So the gateway must issue the
+  /// stop itself, and it has to reach the machine before the silent auto-stop
+  /// or the DE1 idles first and the purge never runs. Tune on hardware: raise
+  /// it if the purge still doesn't fire, lower it if steam ends too early.
+  static const Duration _autoStopLead = Duration(milliseconds: 750);
 
   bool get isRecording => _openId != null;
 
@@ -130,7 +140,34 @@ class SteamSequencer {
     _measurements.clear();
     _appSideStopRequested = false;
     _trackFirstSensor();
+    _scheduleDurationStop();
     _log.info('Steam record opened: $_openId');
+  }
+
+  /// When the configured steam duration elapses, request `idle` — the same
+  /// command a manual stop sends — so the DE1 runs its auto-purge. Without
+  /// this the steam ends on the DE1's own duration with no stop command and
+  /// the purge never fires (purge is bound to the stop, not to duration).
+  void _scheduleDurationStop() {
+    _durationStopTimer?.cancel();
+    _durationStopTimer = null;
+    final seconds =
+        (_openWorkflow ?? _workflow.currentWorkflow).steamSettings.duration;
+    if (seconds <= 0) return;
+    var fireIn = Duration(seconds: seconds) - _autoStopLead;
+    if (fireIn < Duration.zero) fireIn = Duration.zero;
+    _durationStopTimer = Timer(fireIn, _onSteamDurationElapsed);
+  }
+
+  void _onSteamDurationElapsed() {
+    _durationStopTimer = null;
+    if (!isRecording || _appSideStopRequested) return;
+    final machine = _machine;
+    if (machine == null) return;
+    _appSideStopRequested = true;
+    _log.info('Steam duration elapsed; requesting idle so the DE1 auto-purges');
+    // ignore: discarded_futures
+    machine.requestState(MachineState.idle);
   }
 
   void _trackFirstSensor() {
@@ -197,6 +234,8 @@ class SteamSequencer {
   }
 
   void _resetOpenState() {
+    _durationStopTimer?.cancel();
+    _durationStopTimer = null;
     _openId = null;
     _openTimestamp = null;
     _openWorkflow = null;
@@ -209,6 +248,8 @@ class SteamSequencer {
   }
 
   Future<void> dispose() async {
+    _durationStopTimer?.cancel();
+    _durationStopTimer = null;
     await _de1Sub?.cancel();
     _de1Sub = null;
     await _snapshotSub?.cancel();
