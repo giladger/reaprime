@@ -77,6 +77,7 @@ import 'package:reaprime/src/services/telemetry/anonymization.dart';
 import 'package:reaprime/src/services/telemetry/error_report_throttle.dart';
 import 'package:reaprime/src/services/telemetry/telemetry_forwarder_filter.dart';
 import 'package:reaprime/src/services/webview_log_service.dart';
+import 'package:reaprime/src/skin_feature/simulated_webview_device.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 
 /// Set system information as custom keys in telemetry service.
@@ -127,6 +128,37 @@ Set<SimulatedDevicesTypes> _parseSimulateFlag(String value) {
       .toSet();
 }
 
+const _defaultDesktopWindowSize = Size(1280, 800);
+const _defaultDesktopAspectRatio = 1.6;
+
+Future<void> _setSimulatedWebViewDevice(
+  SimulatedWebViewDevice? device, {
+  bool persist = true,
+}) async {
+  simulatedWebViewDevice.value = device;
+  if (persist) {
+    await persistSimulatedWebViewDevice(device);
+  }
+
+  if (device == null) {
+    await WindowManager.instance.setMinimumSize(_defaultDesktopWindowSize);
+    await WindowManager.instance.setAspectRatio(_defaultDesktopAspectRatio);
+    await WindowManager.instance.setSize(_defaultDesktopWindowSize);
+    await WindowManager.instance.center();
+    await WindowManager.instance.focus();
+    return;
+  }
+
+  final windowSize = device.viewportSize;
+  await WindowManager.instance.setMinimumSize(windowSize);
+  await WindowManager.instance.setAspectRatio(
+    windowSize.width / windowSize.height,
+  );
+  await WindowManager.instance.setSize(windowSize);
+  await WindowManager.instance.center();
+  await WindowManager.instance.focus();
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // Force the semantics tree to always be active so assistive technologies
@@ -144,9 +176,18 @@ void main() async {
 
   if (Platform.isWindows || Platform.isMacOS) {
     await WindowManager.instance.ensureInitialized();
-    WindowManager.instance.setMinimumSize(const Size(1280, 800));
-    await WindowManager.instance.setAspectRatio(1.6);
-    await WindowManager.instance.setSize(const Size(1280, 800));
+    WindowManager.instance.setMinimumSize(_defaultDesktopWindowSize);
+    await WindowManager.instance.setAspectRatio(_defaultDesktopAspectRatio);
+    await WindowManager.instance.setSize(_defaultDesktopWindowSize);
+    final startupSimulatedWebViewDevice = kDebugMode && Platform.isMacOS
+        ? await loadPersistedSimulatedWebViewDevice()
+        : null;
+    if (startupSimulatedWebViewDevice != null) {
+      await _setSimulatedWebViewDevice(
+        startupSimulatedWebViewDevice,
+        persist: false,
+      );
+    }
   }
 
   final appDocsPath = (await getApplicationDocumentsDirectory()).path;
@@ -434,9 +475,13 @@ void main() async {
   settingsController.addListener(() {
     // Merge dart-define devices with user-selected devices from settings
     const simEnv = String.fromEnvironment("simulate");
-    final dartDefineDevices = simEnv.isNotEmpty ? _parseSimulateFlag(simEnv) : <SimulatedDevicesTypes>{};
-    simulatedDevicesService.enabledDevices =
-        {...dartDefineDevices, ...settingsController.simulatedDevices};
+    final dartDefineDevices = simEnv.isNotEmpty
+        ? _parseSimulateFlag(simEnv)
+        : <SimulatedDevicesTypes>{};
+    simulatedDevicesService.enabledDevices = {
+      ...dartDefineDevices,
+      ...settingsController.simulatedDevices,
+    };
   });
   await settingsController.loadSettings();
 
@@ -607,8 +652,7 @@ class AppLifecycleObserver with WidgetsBindingObserver {
                 if (Platform.isAndroid) {
                   _showAndroidDownloadDialog(context, updateInfo);
                 } else {
-                  final releaseUrl =
-                      updateCheckService?.getReleaseUrl();
+                  final releaseUrl = updateCheckService?.getReleaseUrl();
                   if (releaseUrl != null) {
                     launchUrl(Uri.parse(releaseUrl));
                   }
@@ -639,50 +683,48 @@ class AppLifecycleObserver with WidgetsBindingObserver {
       final releaseUrl = updateCheckService?.getReleaseUrl();
       showDialog(
         context: context,
-        builder:
-            (ctx) => AlertDialog(
-              title: Text('Update ${info.version}'),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Version ${info.version} is available'),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Current version: ${BuildInfo.version}',
-                  ),
-                  if (info.releaseNotes.isNotEmpty) ...[
-                    const SizedBox(height: 16),
-                    const Text(
-                      'Release Notes:',
-                      style: TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                    const SizedBox(height: 8),
-                    Container(
-                      constraints:
-                          const BoxConstraints(maxHeight: 200),
-                      child: SingleChildScrollView(
-                        child: Text(info.releaseNotes),
-                      ),
-                    ),
-                  ],
-                ],
+        builder: (ctx) => AlertDialog(
+          title: Text('Update ${info.version}'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Version ${info.version} is available'),
+              const SizedBox(height: 8),
+              Text(
+                'Current version: ${BuildInfo.version}',
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('Later'),
+              if (info.releaseNotes.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                const Text(
+                  'Release Notes:',
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-                if (releaseUrl != null)
-                  ElevatedButton(
-                    onPressed: () {
-                      Navigator.of(ctx).pop();
-                      launchUrl(Uri.parse(releaseUrl));
-                    },
-                    child: const Text('Download'),
+                const SizedBox(height: 8),
+                Container(
+                  constraints: const BoxConstraints(maxHeight: 200),
+                  child: SingleChildScrollView(
+                    child: Text(info.releaseNotes),
                   ),
+                ),
               ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Later'),
             ),
+            if (releaseUrl != null)
+              ElevatedButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  launchUrl(Uri.parse(releaseUrl));
+                },
+                child: const Text('Download'),
+              ),
+          ],
+        ),
       );
     }
   }
@@ -877,6 +919,32 @@ class _AppRootState extends State<AppRoot> {
               }
             },
           ),
+          if (kDebugMode) ...[
+            PlatformMenuItem(
+              label: 'Use Native macOS WebView',
+              shortcut: const SingleActivator(
+                LogicalKeyboardKey.digit0,
+                alt: true,
+                meta: true,
+              ),
+              onSelected: () async {
+                await _setSimulatedWebViewDevice(null);
+              },
+            ),
+            PlatformMenuItem(
+              label: 'Simulate Teclast M50/T50 Mini WebView',
+              shortcut: const SingleActivator(
+                LogicalKeyboardKey.digit8,
+                alt: true,
+                meta: true,
+              ),
+              onSelected: () async {
+                await _setSimulatedWebViewDevice(
+                  SimulatedWebViewDevice.teclastT50Mini,
+                );
+              },
+            ),
+          ],
         ],
       ),
     ];
@@ -899,8 +967,7 @@ class _AndroidQuickUpdateDialog extends StatefulWidget {
       _AndroidQuickUpdateDialogState();
 }
 
-class _AndroidQuickUpdateDialogState
-    extends State<_AndroidQuickUpdateDialog> {
+class _AndroidQuickUpdateDialogState extends State<_AndroidQuickUpdateDialog> {
   bool _isDownloading = true;
   bool _isInstalling = false;
   String? _error;
