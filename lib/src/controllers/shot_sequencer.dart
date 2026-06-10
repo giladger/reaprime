@@ -50,6 +50,21 @@ class ShotSequencer {
   DateTime? _lastVolumeUpdateTime;
   bool _volumeCountingActive = false;
 
+  // Final beverage weight on weighed shots, latched at the machine-reported
+  // shot end and then refined only by plausible post-stop drips. On those
+  // shots the saved trace stops at that boundary, so only this value — not the
+  // graph — follows the drips, and cup removal or touch spikes can't rewrite
+  // the recorded yield. Null when no scale is weighing the shot.
+  static const double _maxPostStopYieldIncrease = 5.0;
+  static const double _maxPostStopSampleIncrease = 2.0;
+  static const double _maxTrustedPostStopWeightFlow = 3.0;
+  double? _latchedStopYield;
+  double? _trustedFinalYield;
+
+  double? get trustedFinalYield => _trustedFinalYield == null
+      ? null
+      : (_trustedFinalYield! * 10).roundToDouble() / 10;
+
   ShotSequencer({
     required this.scaleController,
     required this.de1controller,
@@ -246,6 +261,8 @@ class ShotSequencer {
           _accumulatedVolume = 0.0;
           _lastVolumeUpdateTime = null;
           _volumeCountingActive = false;
+          _latchedStopYield = null;
+          _trustedFinalYield = null;
           skippedSteps.clear();
 
           if (_bypassSAW == false && scale != null && !_scaleLost) {
@@ -311,8 +328,7 @@ class ShotSequencer {
             de1controller.connectedDe1().requestState(
               MachineState.idle,
             ); // Send stop command to machine
-            _state = ShotState.stopping;
-            _stateStream.add(_state);
+            _enterStopping(scale);
             break;
           }
         }
@@ -330,19 +346,19 @@ class ShotSequencer {
             de1controller.connectedDe1().requestState(
               MachineState.idle,
             ); // Send stop command to machine
-            _state = ShotState.stopping;
-            _stateStream.add(_state);
+            _enterStopping(scale);
             break;
           }
         }
         if (machine.state.substate == MachineSubstate.pouringDone ||
             machine.state.substate == MachineSubstate.idle) {
-          _state = ShotState.stopping;
-          _stateStream.add(_state);
+          _enterStopping(scale);
         }
         break;
 
       case ShotState.stopping:
+        _updateTrustedFinalYield(scale);
+
         // Stop volume counting and scale timer
         _volumeCountingActive = false;
         if (_bypassSAW == false && scale != null && !_scaleLost) {
@@ -370,6 +386,51 @@ class ShotSequencer {
         break;
     }
     _log.finest("State out: ${_state.name}");
+  }
+
+  void _enterStopping(WeightSnapshot? scale) {
+    _latchTrustedFinalYield(scale);
+    // Recording stops at the machine-reported shot end.
+    dataCollectionEnabled = false;
+    // The post-stop window exists solely to catch the final drips on the scale
+    // and fold them into the yield. With a scale, hold in `stopping` while they
+    // settle (see _updateTrustedFinalYield). Without one there is nothing to
+    // catch, so end the shot immediately — no settling window, no waiting.
+    _state = _trustedFinalYield != null
+        ? ShotState.stopping
+        : ShotState.finished;
+    _stateStream.add(_state);
+  }
+
+  void _latchTrustedFinalYield(WeightSnapshot? scale) {
+    final weight = scale?.weight;
+    if (weight == null || weight <= 0 || !weight.isFinite) return;
+    _latchedStopYield = weight;
+    _trustedFinalYield = weight;
+  }
+
+  void _updateTrustedFinalYield(WeightSnapshot? scale) {
+    final weight = scale?.weight;
+    if (weight == null || weight <= 0 || !weight.isFinite) return;
+
+    if (_trustedFinalYield == null) {
+      _latchTrustedFinalYield(scale);
+      return;
+    }
+
+    final trusted = _trustedFinalYield!;
+    if (weight <= trusted) return;
+
+    final sampleIncrease = weight - trusted;
+    if (sampleIncrease > _maxPostStopSampleIncrease) return;
+
+    final latched = _latchedStopYield ?? trusted;
+    if (weight - latched > _maxPostStopYieldIncrease) return;
+
+    final flow = scale!.weightFlow;
+    if (flow.isFinite && flow > _maxTrustedPostStopWeightFlow) return;
+
+    _trustedFinalYield = weight;
   }
 }
 

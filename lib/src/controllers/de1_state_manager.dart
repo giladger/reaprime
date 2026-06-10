@@ -619,6 +619,9 @@ class De1StateManager with WidgetsBindingObserver {
       return;
     }
 
+    // The trace already stops at the machine-reported shot end — the sequencer
+    // disables data collection on entering `stopping`, so the post-stop drip
+    // window never reaches these snapshots. Only the yield below reflects it.
     final measurements = List<ShotSnapshot>.from(_currentShotSnapshots);
     final baseWorkflow = _workflowController.currentWorkflow;
     final startTime = _currentShotSequencer!.shotStartTime;
@@ -651,6 +654,7 @@ class De1StateManager with WidgetsBindingObserver {
         annotations: ShotAnnotations.deriveForFinishedShot(
           measurements: measurements,
           targetDoseWeight: baseWorkflow.context?.targetDoseWeight,
+          preferredYield: _currentShotSequencer!.trustedFinalYield,
         ),
       ),
     );
