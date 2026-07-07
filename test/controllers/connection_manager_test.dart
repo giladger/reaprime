@@ -1901,6 +1901,83 @@ void main() {
           async.flushMicrotasks();
         });
       });
+
+      test(
+          'forced reconnects are rate-limited by a cooldown (no reconnect '
+          'storm on a persistently silent push channel)', () {
+        fakeAsync((async) {
+          final manager = newManager();
+          final fakeDe1 = _FakeDe1(deviceId: 'stale-de1');
+          mockDe1Controller.de1Subject.add(fakeDe1);
+          async.flushMicrotasks();
+          fakeDe1.emitState(MachineState.idle);
+          async.flushMicrotasks();
+
+          // First staleness window forces reconnect #1 and starts the 60s
+          // cooldown.
+          async.elapse(const Duration(seconds: 11));
+          expect(manager.snapshotStalenessReconnects, 1);
+
+          // Simulate the machine returning after the forced reconnect (in
+          // production `connect()` re-adds it), re-arming the watchdog. The
+          // push channel is still dead — no frames — so it will keep
+          // expiring.
+          mockDe1Controller.de1Subject.add(fakeDe1);
+          async.flushMicrotasks();
+
+          // Several more staleness windows elapse, all inside the 60s
+          // cooldown → the watchdog must defer, never forcing again. This
+          // is exactly the ~10s disconnect/reconnect storm the cooldown
+          // prevents.
+          async.elapse(const Duration(seconds: 40)); // ~51s since force #1
+          expect(manager.snapshotStalenessReconnects, 1,
+              reason: 'a stale channel within the cooldown must not re-force');
+
+          // Once the cooldown lapses, a still-stale channel forces again.
+          async.elapse(const Duration(seconds: 20)); // ~71s since force #1
+          expect(manager.snapshotStalenessReconnects, 2,
+              reason: 'after the cooldown expires the watchdog may force once '
+                  'more');
+
+          manager.dispose();
+          async.flushMicrotasks();
+        });
+      });
+
+      // Runs in the real async zone (not fakeAsync): the forced reconnect's
+      // `disconnectMachine → connect` chain awaits `de1Controller.de1.first`,
+      // which a BehaviorSubject does not settle under fakeAsync — so the
+      // strand safety-net in the `finally` only runs with real microtasks.
+      // A short overridden staleness timeout keeps the test fast.
+      test(
+          'a forced reconnect that cannot recover the machine hands off to '
+          'the recovery loop (no strand)', () async {
+        await settingsController.setPreferredMachineId('stale-de1');
+        // Non-zero base delay avoids a hot recovery loop within the wait
+        // window; we only assert the loop is armed, not how often it scans.
+        connectionManager.machineReconnectBaseDelay =
+            const Duration(milliseconds: 50);
+        connectionManager.snapshotStalenessTimeout =
+            const Duration(milliseconds: 20);
+        final fakeDe1 = _FakeDe1(deviceId: 'stale-de1');
+        mockDe1Controller.de1Subject.add(fakeDe1);
+        await Future<void>.delayed(Duration.zero);
+        fakeDe1.emitState(MachineState.idle);
+        await Future<void>.delayed(Duration.zero);
+
+        // Let the 20ms watchdog fire and force a reconnect. The scanner
+        // surfaces no machine, so the forced `connect()` completes without
+        // reconnecting → the machine is left disconnected. `disconnectMachine`
+        // marked the drop expected, so the unexpected-disconnect path never
+        // armed recovery; without the safety net nothing would retry.
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+
+        expect(connectionManager.snapshotStalenessReconnects, greaterThan(0),
+            reason: 'the watchdog must have forced a reconnect');
+        expect(connectionManager.machineRecoveryActive, isTrue,
+            reason: 'a stranded forced reconnect must hand off to the '
+                'machine-recovery loop, not leave the machine disconnected');
+      });
     });
   });
 }

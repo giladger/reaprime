@@ -189,8 +189,10 @@ class ConnectionManager {
   /// snapshot frames for this long, the push channel is presumed dead
   /// (live-link + dead-push — the field incident of 2026-07-07). A clean
   /// forced reconnect re-establishes notifications. See Fix #1.
+  /// Overridable in tests so the watchdog can be driven without a real
+  /// 10s wait.
   @visibleForTesting
-  static const Duration snapshotStalenessTimeout = Duration(seconds: 10);
+  Duration snapshotStalenessTimeout = const Duration(seconds: 10);
 
   Timer? _stateWatchdog;
   int _watchdogGeneration = 0;
@@ -200,6 +202,24 @@ class ConnectionManager {
   /// driving the full disconnect+connect cycle through fake_async.
   @visibleForTesting
   int snapshotStalenessReconnects = 0;
+
+  /// Minimum spacing between watchdog-forced reconnects. A forced reconnect
+  /// can restore the link while the push channel is still dead — a
+  /// genuinely quiet sleeping DE1, or a firmware whose ShotSample (A00D)
+  /// cadence drops below [snapshotStalenessTimeout]. Without a floor the
+  /// watchdog re-arms on every reconnect and fires again ~10s later,
+  /// churning the BLE radio in a disconnect/reconnect loop — the very
+  /// LINK_SUPERVISION_TIMEOUT hazard the reconnect exists to avoid. This
+  /// caps the blast radius to one forced reconnect per interval.
+  @visibleForTesting
+  static const Duration forceReconnectCooldown = Duration(seconds: 60);
+
+  /// Non-null while a forced reconnect is cooling down. Deliberately *not*
+  /// cleared by [_stopWatchingConnectedMachineState]: a forced reconnect
+  /// routes through `disconnectMachine` (which stops the watcher) and then
+  /// reconnects, so the cooldown must survive that very cycle to cap it.
+  Timer? _forceReconnectCooldownTimer;
+  bool get _forceReconnectOnCooldown => _forceReconnectCooldownTimer != null;
 
   /// Set true by [_checkEarlyStop] when it actually cut the scan short on
   /// machine-connect with no preferred scale. Distinguishes that case
@@ -729,6 +749,11 @@ class ConnectionManager {
     _machineReconnectFailures = 0;
   }
 
+  /// Whether the machine auto-reconnect recovery loop is currently armed.
+  /// Test hook for asserting the staleness watchdog's strand safety-net.
+  @visibleForTesting
+  bool get machineRecoveryActive => _machineRecoveryActive;
+
   bool _shouldRetryMachine() {
     return _machineRecoveryActive &&
         !_machineConnected &&
@@ -805,6 +830,18 @@ class ConnectionManager {
       if (!_machineConnected) return;
       final current = _disconnectSupervisor.latestMachine;
       if (current?.deviceId != deviceId) return;
+      if (_forceReconnectOnCooldown) {
+        // The channel is still stale, but a forced reconnect is already
+        // cooling down. Forcing again now would churn the radio, so re-arm
+        // and re-check after another staleness window; once the cooldown
+        // lapses the next expiry forces a fresh reconnect.
+        _log.fine(
+          'Snapshot stream still stale for $deviceId but a forced reconnect '
+          'is on cooldown; deferring',
+        );
+        _armStateWatchdog(deviceId);
+        return;
+      }
       _log.warning(
         'Snapshot stream stale for $deviceId after '
         '${snapshotStalenessTimeout.inSeconds}s with link still '
@@ -821,6 +858,7 @@ class ConnectionManager {
   /// error banner surfaces.
   Future<void> _forceMachineReconnect() async {
     snapshotStalenessReconnects++;
+    _startForceReconnectCooldown();
     _watchdogGeneration++;
     _stateWatchdog?.cancel();
     _stateWatchdog = null;
@@ -829,7 +867,29 @@ class ConnectionManager {
       await connect();
     } catch (e, st) {
       _log.fine('Forced machine reconnect failed', e, st);
+    } finally {
+      // Safety net against stranding the machine. `disconnectMachine`
+      // marked the drop expected, so the unexpected-disconnect path never
+      // armed machine recovery; and the `connect()` above can be silently
+      // dropped by the concurrent-connect guard (e.g. a scale-only rescan
+      // already in flight — likely in the post-wake zombie window) or
+      // return without finding the machine. If we're still machineless,
+      // hand off to the recovery loop: it retries with backoff and cancels
+      // itself the moment the machine reconnects (no-op without a
+      // preferredMachineId, where a background retry could pop a picker).
+      if (!_machineConnected) {
+        _startMachineRecovery();
+      }
     }
+  }
+
+  /// Arm (or re-arm) the [forceReconnectCooldown] window after a forced
+  /// reconnect, throttling how often the watchdog may force again.
+  void _startForceReconnectCooldown() {
+    _forceReconnectCooldownTimer?.cancel();
+    _forceReconnectCooldownTimer = Timer(forceReconnectCooldown, () {
+      _forceReconnectCooldownTimer = null;
+    });
   }
 
   void _pauseScaleReconnectForPowerMode() {
@@ -1222,6 +1282,8 @@ class ConnectionManager {
     _stopMachineRecovery();
     _deferredScaleScan?.cancel();
     _cancelPreferredScaleReconnect();
+    _forceReconnectCooldownTimer?.cancel();
+    _forceReconnectCooldownTimer = null;
     _stopWatchingConnectedMachineState();
     await de1Controller.dispose();
     scaleController.dispose();
